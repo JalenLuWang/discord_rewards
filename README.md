@@ -53,8 +53,10 @@ These steps use **a background Python process plus a Railway PostgreSQL database
 | Command | Who | Example |
 | --- | --- | --- |
 | `/points setup` | Manage Server admins | Select 3 channels using Discord channel pickers |
-| `/points add` | Admins | `/points add member:@Alex amount:5 reason:Scrim MVP/SVP leader` |
-| `/points remove` | Admins | `/points remove member:@Alex amount:1 reason:Incorrect attendance entry` |
+| `/points add` | Admins | `/points add members:@Alex @Sam total_points:5 reason:Scrim MVP/SVP leader` |
+| `/points remove` | Admins | `/points remove members:@Alex @Sam total_points:1 reason:Incorrect attendance entry` (deduct some points) |
+| `/points remove-player` | Admins | `/points remove-player members:@Alex @Sam reason:Left the team` (zero points and hide players) |
+| `/points restore-player` | Admins | `/points restore-player members:@Alex reason:Rejoined team` (re-activate with 0 points) |
 | `/points balance` | Everyone | `/points balance member:@Alex` |
 | `/points history` | Everyone | `/points history member:@Alex` (10 most recent) |
 | `/points leaderboard` | Everyone | See top 20 (the pinned message also auto-updates) |
@@ -65,6 +67,37 @@ These steps use **a background Python process plus a Railway PostgreSQL database
 | `/points refresh` | Admins | Force a leaderboard refresh |
 
 The `/points setup` command requires **Manage Server**, not just access to `#points-log`. Only admins should have this permission. The bot also independently checks admin permissions at runtime.
+
+## Bulk member commands (new)
+
+Both `/points add` and `/points remove` have exactly these input fields:
+
+- **members**: One or more **Discord @mentions** (or numeric IDs), pasted together and separated by spaces or commas. Up to **25 unique members** per command. A Discord slash command cannot provide a native multi-member picker, so paste multiple mentions into this text input. Example: `<@123456789012345678> <@234567890123456789>` (replace with real member mentions/IDs).
+- **total_points**: The number of points to add/deduct **for each selected member**, not a pot to split.
+- **reason**: Shared reason recorded in each member's transaction history.
+
+**Examples:**
+
+- `/points add members:@Alex @Sam @Taylor total_points:1 reason:Scrim participation 11/23`
+- `/points add members:@Alex @Sam total_points:5 reason:MRC stage 2 MVP/SVP leaders`
+- `/points add members:@Alex @Sam @Taylor total_points:5 reason:Full-day tournament participation`
+- `/points remove members:@Alex @Sam total_points:1 reason:Attendance correction`
+
+The bot verifies all IDs belong to the server, ignores duplicate mentions, and applies the whole batch **atomically**. For deductions, if even one member lacks enough points, **none** are deducted. Every member gets an individual audit-log entry; leaderboard refreshes once at the end. Admin permission is required. For different point amounts, use separate batches.
+
+## Remove a player completely (new)
+
+Use `/points remove-player` with **members** and mandatory **reason**. You can include up to 25 server members. This is different from `/points remove`, which simply subtracts the entered number of points.
+
+- All existing points are set to **0**, and the player is **removed from the leaderboard** (even if they earn points in a future season, they cannot be re-added unless restored).
+- Any pending redemption requests are **denied automatically**. Already approved/fulfilled rewards are not reversed.
+- The removal reason, admin, timestamp, and number of points cleared are recorded in an independent permanent `player_status_events` audit table. A `player_removed` negative points ledger entry is also recorded for nonzero balances.
+- Removal shows up in `#points-log`, and the pinned leaderboard refreshes automatically.
+- Bulk removals are **all-or-nothing**: if any person was already removed, no one in that batch is changed.
+- To let someone participate again, use `/points restore-player members:@Alex reason:Rejoined team`. They come back with **0 points**, not their old balance. Past transaction and removal records remain preserved.
+- The commands accept **existing server members** only, and require **Manage Server** permission.
+
+**Example:** `/points remove-player members:@Alex @Sam reason:No longer on roster`.
 
 ## Your point rules
 
@@ -92,7 +125,7 @@ Awards are **manual**, not automatic based on match results: this avoids needing
 ## Operational notes
 
 - The database is the source of truth. If Discord logging fails due to missing permissions, a transaction may still succeed in the database; `/points history` remains authoritative. Correct permissions promptly.
-- Leaderboard displays **top 20 non-zero balances**; all other balances are still retained and available via `/points balance`.
+- Leaderboard displays **top 20 active non-zero balances**; all other balances are still retained and available via `/points balance`.
 - Deleting a Discord log message does not delete the transaction record.
 - Approving a reward **does not send money, deliver a skin, or validate proof of fulfillment**. Arrange delivery manually.
 - There is currently no separate fulfillment-status field; approval means authorized and points deducted, not proof delivered.
