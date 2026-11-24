@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+from datetime import date
 from typing import Optional
 
 import asyncpg
@@ -10,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from points_core import REWARD_COST, REWARDS, points_summary, point_word, utc_label, parse_member_ids, MAX_BULK_MEMBERS
+from points_core import REWARD_COST, REWARDS, points_summary, point_word, utc_label, parse_member_ids, MAX_BULK_MEMBERS, payout_breakdown, MRC_WEEKLY_PARTICIPATION
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -67,6 +68,12 @@ CREATE TABLE IF NOT EXISTS redemptions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     resolved_at TIMESTAMPTZ
 );
+CREATE TABLE IF NOT EXISTS event_awards (
+    guild_id BIGINT NOT NULL, event_key TEXT NOT NULL, user_id BIGINT NOT NULL, component TEXT NOT NULL,
+    transaction_id BIGINT NOT NULL REFERENCES point_transactions(id),
+    PRIMARY KEY(guild_id,event_key,user_id,component)
+);
+ALTER TABLE redemptions ADD COLUMN IF NOT EXISTS details TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS one_pending_per_member ON redemptions (guild_id,user_id) WHERE status='pending';
 """
 
@@ -139,7 +146,7 @@ async def leaderboard_embed(guild_id: int) -> discord.Embed:
     async with bot.pool.acquire() as db:
         rows = await db.fetch("SELECT user_id, balance FROM balances WHERE guild_id=$1 AND is_active=TRUE AND balance > 0 ORDER BY balance DESC, user_id ASC LIMIT 20", guild_id)
     embed = discord.Embed(title="🏆 MRC Points Leaderboard", description=points_summary(rows), color=0x5865f2)
-    embed.add_field(name="🎁 Rewards", value="**5 points = 1 skin OR $25 cash**", inline=False)
+    embed.add_field(name="🎁 Rewards", value="**1 point = $1** · **20 points = $20 cash or 1 skin (up to $20)**", inline=False)
     embed.set_footer(text="Updated automatically • Top 20 members • /points balance for your balance")
     return embed
 
@@ -271,6 +278,114 @@ async def add(interaction: discord.Interaction, members: app_commands.Range[str,
 async def remove(interaction: discord.Interaction, members: app_commands.Range[str,1,1800], total_points: app_commands.Range[int,1,10000], reason: app_commands.Range[str,2,200]):
     await perform_bulk_adjustment(interaction,members,total_points,reason,deduct=True)
 
+async def award_event(guild_id: int, event_key: str, breakdown: dict[int, dict[str, int]], reason: str, actor_id: int):
+    """Single atomic batch, transaction records + event idempotency in the same transaction."""
+    if not event_key or len(event_key) > 150 or not reason.strip():
+        raise ValueError("A valid event ID and reason are required.")
+    if not breakdown or len(breakdown) > MAX_BULK_MEMBERS:
+        raise ValueError("An event needs between 1 and 25 unique players.")
+    rows = []
+    async with bot.pool.acquire() as db:
+        async with db.transaction():
+            # Serialize all events for one guild+event ID, including concurrent command calls.
+            await db.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",f"{guild_id}:{event_key}")
+            exists = await db.fetchval("SELECT 1 FROM event_awards WHERE guild_id=$1 AND event_key=$2 LIMIT 1",guild_id,event_key)
+            if exists:
+                raise ValueError(f"Event `{event_key}` was already awarded. No points changed. Use /points add or remove for corrections.")
+            for uid in sorted(breakdown):
+                await db.execute("INSERT INTO balances(guild_id,user_id,balance) VALUES($1,$2,0) ON CONFLICT DO NOTHING",guild_id,uid)
+            current = {}
+            for uid in sorted(breakdown):
+                player = await db.fetchrow("SELECT balance,is_active FROM balances WHERE guild_id=$1 AND user_id=$2 FOR UPDATE",guild_id,uid)
+                if not player['is_active']:
+                    raise ValueError(f"<@{uid}> was removed. Restore them before awarding. No points changed.")
+                current[uid] = player['balance']
+            for uid in sorted(breakdown):
+                for component, delta in breakdown[uid].items():
+                    if not delta: continue
+                    current[uid] += delta
+                    await db.execute("UPDATE balances SET balance=$3 WHERE guild_id=$1 AND user_id=$2",guild_id,uid,current[uid])
+                    row = await db.fetchrow("INSERT INTO point_transactions(guild_id,user_id,delta,balance_after,action,reason,actor_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *",guild_id,uid,delta,current[uid],f"{component}_award",f"{event_key} | {reason} | {component}",actor_id)
+                    await db.execute("INSERT INTO event_awards(guild_id,event_key,user_id,component,transaction_id) VALUES($1,$2,$3,$4,$5)",guild_id,event_key,uid,component,row['id'])
+                    rows.append(row)
+    return rows
+
+async def run_event(interaction: discord.Interaction, event_key: str, participants: str, first: str, second: str, reason: str, kind: str):
+    if not await require_admin(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        all_ids = await resolve_bulk_members(interaction.guild, participants)
+        first_ids = await resolve_bulk_members(interaction.guild, first) if first.strip() else []
+        second_ids = await resolve_bulk_members(interaction.guild, second) if second.strip() else []
+        if not first_ids:
+            raise ValueError("Enter the top MVP/SVP winner(s) for the event.")
+        if kind != 'scrim' and not first_ids and second_ids:
+            raise ValueError("Second place requires first place.")
+        breakdown = payout_breakdown(kind,all_ids,first_ids,second_ids)
+        rows = await award_event(interaction.guild_id,f"{kind}:{event_key.strip().lower()}",breakdown,reason,interaction.user.id)
+    except ValueError as exc:
+        await interaction.followup.send(str(exc),ephemeral=True,allowed_mentions=discord.AllowedMentions.none());return
+    for row in rows: await notify_log(interaction.guild,row)
+    await update_leaderboard(interaction.guild)
+    display = '\n'.join(f"• <@{uid}>: **+{sum(parts.values())}** ({', '.join(f'{k}: {v}' for k,v in parts.items())})" for uid,parts in breakdown.items())
+    await interaction.followup.send(f"**{kind} awarded** · `{event_key}`\n{display}\nEach change has its own log entry. Re-running this event ID is blocked.",ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
+
+@points.command(name="scrim", description="Admin: scrim BO3/BO5, +1 to all (including benched), +9 split for top MVP/SVP")
+@app_commands.describe(event_id="Unique ID per BO3/BO5, e.g. 2026-11-24-bo3-a", members="All roster members including benched, @mentions/IDs (max 25)", first="Members tied for most MVPs/SVPs", reason="Required scrim name or opponent")
+async def scrim(interaction: discord.Interaction,event_id: app_commands.Range[str,1,80],members: app_commands.Range[str,1,1800],first: app_commands.Range[str,1,1800],reason: app_commands.Range[str,2,200]):
+    await run_event(interaction,event_id,members,first,'',reason,'scrim')
+
+@points.command(name="mrc-week", description="Admin: +1 MRC weekly attendance, including benched, once per week")
+@app_commands.describe(week="Any date in week (YYYY-MM-DD); week starts Monday", members="All attending/benched members, @mentions/IDs", reason="Required attendance explanation")
+async def mrc_week(interaction: discord.Interaction,week: str,members: app_commands.Range[str,1,1800],reason: app_commands.Range[str,2,200]):
+    if not await require_admin(interaction):return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        day=date.fromisoformat(week)
+        from datetime import timedelta
+        monday=day-timedelta(days=day.weekday())
+        ids=await resolve_bulk_members(interaction.guild,members)
+        # Weekly awards across multiple batches: keep existing members, prevent double grants.
+        rows=await award_week(interaction.guild_id,monday.isoformat(),ids,reason,interaction.user.id)
+    except ValueError as exc:
+        await interaction.followup.send(f"Invalid attendance: {exc}",ephemeral=True);return
+    for row in rows:await notify_log(interaction.guild,row)
+    await update_leaderboard(interaction.guild)
+    await interaction.followup.send(f"MRC participation for week of **{monday}**: **+1 point** each to {len(rows)} members. Already-awarded members are not charged twice.",ephemeral=True)
+
+async def award_week(guild_id: int, week: str, ids: list[int], reason: str, actor_id: int):
+    key=f"mrc-week:{week}"
+    rows=[]
+    async with bot.pool.acquire() as db:
+        async with db.transaction():
+            await db.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",f"{guild_id}:{key}")
+            for uid in sorted(ids):
+                await db.execute("INSERT INTO balances(guild_id,user_id,balance) VALUES($1,$2,0) ON CONFLICT DO NOTHING",guild_id,uid)
+            for uid in sorted(ids):
+                player=await db.fetchrow("SELECT balance,is_active FROM balances WHERE guild_id=$1 AND user_id=$2 FOR UPDATE",guild_id,uid)
+                if not player['is_active']:
+                    raise ValueError(f"<@{uid}> has been removed. No weekly points changed.")
+            for uid in ids:
+                exists=await db.fetchval("SELECT 1 FROM event_awards WHERE guild_id=$1 AND event_key=$2 AND user_id=$3",guild_id,key,uid)
+                if exists:continue
+                balance=await db.fetchval("UPDATE balances SET balance=balance+1 WHERE guild_id=$1 AND user_id=$2 RETURNING balance",guild_id,uid)
+                row=await db.fetchrow("INSERT INTO point_transactions(guild_id,user_id,delta,balance_after,action,reason,actor_id) VALUES($1,$2,1,$3,'mrc_week_participation',$4,$5) RETURNING *",guild_id,uid,balance,f"{key} | {reason}",actor_id)
+                await db.execute("INSERT INTO event_awards(guild_id,event_key,user_id,component,transaction_id) VALUES($1,$2,$3,'participation',$4)",guild_id,key,uid,row['id'])
+                rows.append(row)
+    return rows
+
+@points.command(name="mrc-stage", description="Admin: per stage/day +29 first, +14 second, ties split pools")
+@app_commands.describe(event_id="Unique stage/day ID, e.g. cq-day1 or rounds-1-3", members="Players in stage, @mentions or IDs", first="First-place players (ties allowed)", second="Second-place players (leave empty when first place tied)", reason="Required description")
+async def mrc_stage(interaction: discord.Interaction,event_id: app_commands.Range[str,1,80],members: app_commands.Range[str,1,1800],first: app_commands.Range[str,1,1800],reason: app_commands.Range[str,2,200],second: str = ""):
+    await run_event(interaction,event_id,members,first,second,reason,'mrc-stage')
+
+@points.command(name="tournament", description="Admin: full-day +1 attendance, +19 first, +9 second, ties split")
+@app_commands.describe(event_id="Unique tournament/day ID", members="Full-day participants only", first="First-place MVP/SVP players", second="Second-place MVP/SVP players, leave empty if first tied", reason="Required tournament name", full_day="Confirm listed players committed for full day")
+async def tournament(interaction: discord.Interaction,event_id: app_commands.Range[str,1,80],members: app_commands.Range[str,1,1800],first: app_commands.Range[str,1,1800],reason: app_commands.Range[str,2,200],full_day: bool, second: str = ""):
+    if not full_day:
+        await interaction.response.send_message("Tournament attendance requires a full-day commitment. Set full_day to True only after verifying attendance.",ephemeral=True);return
+    await run_event(interaction,event_id,members,first,second,reason,'tournament')
+
 async def change_player_status(guild_id: int, member_ids: list[int], reason: str, actor_id: int, *, restore: bool):
     """Atomically remove (zero and hide) or restore players, retaining audit history."""
     if not reason.strip():
@@ -352,7 +467,7 @@ async def balance(interaction: discord.Interaction, member: Optional[discord.Mem
     async with bot.pool.acquire() as db:
         active = await db.fetchval("SELECT is_active FROM balances WHERE guild_id=$1 AND user_id=$2", interaction.guild_id,target.id)
     status = " **(removed from leaderboard)**" if active is False else ""
-    await interaction.response.send_message(f"{target.mention} has **{current or 0}** points{status}. (5 points = a skin or $25)",ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.send_message(f"{target.mention} has **{current or 0}** points{status}. (1 point = $1; 20 points = $20 cash or 1 skin up to $20)",ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
 
 @points.command(name="leaderboard", description="Show the current leaderboard")
 async def leaderboard(interaction: discord.Interaction):
@@ -370,8 +485,10 @@ async def history(interaction: discord.Interaction, member: Optional[discord.Mem
     await interaction.response.send_message(f"**Last {len(rows)} transactions for {target.mention}:**\n"+"\n".join(lines),ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
 
 @app_commands.choices(reward=[app_commands.Choice(name=k, value=v) for k,v in REWARDS.items()])
-@points.command(name="redeem", description="Request a skin or $25 cash for 5 points (admin approval required)")
-async def redeem(interaction: discord.Interaction, reward: app_commands.Choice[str]):
+@points.command(name="redeem", description="Request $20 cash or a skin (up to $20) per 20 points, admin approval")
+@app_commands.describe(quantity="Number of $20 cash units or skins (20 points each)", details="Skin name or optional payout note")
+async def redeem(interaction: discord.Interaction, reward: app_commands.Choice[str], quantity: app_commands.Range[int,1,25] = 1, details: app_commands.Range[str,0,200] = ""):
+    cost = REWARD_COST * quantity
     await interaction.response.defer(ephemeral=True)
     settings=await get_settings(interaction.guild_id)
     channel=await get_channel(interaction.guild,settings['approvals_channel_id'] if settings else None)
@@ -386,8 +503,8 @@ async def redeem(interaction: discord.Interaction, reward: app_commands.Choice[s
             if active is False:
                 await interaction.followup.send("Your points membership was removed. Ask an admin to restore you before redeeming.",ephemeral=True)
                 return
-            if current < REWARD_COST:
-                await interaction.followup.send(f"You need **5 points** to redeem; you have **{current}**.",ephemeral=True)
+            if current < cost:
+                await interaction.followup.send(f"You need **{cost} points** to redeem; you have **{current}**.",ephemeral=True)
                 return
             existing=await db.fetchval("SELECT id FROM redemptions WHERE guild_id=$1 AND user_id=$2 AND status='pending'", interaction.guild_id, interaction.user.id)
             if existing:
@@ -395,17 +512,17 @@ async def redeem(interaction: discord.Interaction, reward: app_commands.Choice[s
                 return
             try:
                 async with db.transaction():  # savepoint handles two near-simultaneous requests safely
-                    row=await db.fetchrow("INSERT INTO redemptions(guild_id,user_id,reward,cost) VALUES($1,$2,$3,$4) RETURNING *",interaction.guild_id,interaction.user.id,reward.value,REWARD_COST)
+                    row=await db.fetchrow("INSERT INTO redemptions(guild_id,user_id,reward,cost,details) VALUES($1,$2,$3,$4,$5) RETURNING *",interaction.guild_id,interaction.user.id,reward.value,cost,details)
             except asyncpg.UniqueViolationError:
                 await interaction.followup.send("You already have a pending redemption. Ask an admin to resolve it first.",ephemeral=True)
                 return
     try:
-        await channel.send(f"🎁 **New redemption request #{row['id']}**\nMember: <@{interaction.user.id}>\nReward: **{reward.value}**\nCost: **5 points**\nAdmin: `/points approve request_id:{row['id']}` or `/points deny request_id:{row['id']}`\n*Points are deducted only after approval.*",allowed_mentions=discord.AllowedMentions.none())
+        await channel.send(f"🎁 **New redemption request #{row['id']}**\nMember: <@{interaction.user.id}>\nReward: **{quantity} × {reward.value}**\nDetails: {discord.utils.escape_markdown(details) if details else "None"}\nCost: **{cost} points**\nAdmin: `/points approve request_id:{row['id']}` or `/points deny request_id:{row['id']}`\n*Points are deducted only after approval.*",allowed_mentions=discord.AllowedMentions.none())
     except (discord.Forbidden, discord.HTTPException):
         log.exception("Failed to publish redemption request %s, admins can find it via /points requests", row['id'])
         await interaction.followup.send(f"Request **#{row['id']}** saved, but I couldn't post to the approvals channel. Tell an admin to check `/points requests`.",ephemeral=True)
         return
-    await interaction.followup.send(f"Request **#{row['id']}** submitted for **{reward.value}**. Your points will only be deducted if an admin approves it.",ephemeral=True)
+    await interaction.followup.send(f"Request **#{row['id']}** submitted for **{quantity} × {reward.value}** ({cost} points). Your points will only be deducted if an admin approves it.",ephemeral=True)
 
 @points.command(name="requests", description="Admin: see the latest pending redemptions")
 async def requests(interaction: discord.Interaction):
@@ -437,13 +554,13 @@ async def approve(interaction: discord.Interaction, request_id: int):
                 return
             after=current-req['cost']
             await db.execute("UPDATE balances SET balance=$3 WHERE guild_id=$1 AND user_id=$2",interaction.guild_id,req['user_id'],after)
-            tx=await db.fetchrow("INSERT INTO point_transactions(guild_id,user_id,delta,balance_after,action,reason,actor_id,redemption_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *",interaction.guild_id,req['user_id'],-req['cost'],after,"redemption",f"Approved redemption #{req['id']}: {req['reward']}",interaction.user.id,req['id'])
+            tx=await db.fetchrow("INSERT INTO point_transactions(guild_id,user_id,delta,balance_after,action,reason,actor_id,redemption_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *",interaction.guild_id,req['user_id'],-req['cost'],after,"redemption",f"Approved redemption #{req['id']}: {req['reward']} ({req['cost']} points)",interaction.user.id,req['id'])
             await db.execute("UPDATE redemptions SET status='approved',reviewer_id=$2,resolved_at=now() WHERE id=$1",req['id'],interaction.user.id)
     await post_change(interaction.guild,tx)
     await interaction.followup.send(f"Approved request **#{request_id}**. Deducted **{req['cost']}** from <@{req['user_id']}>. Balance: **{after}**. **You must fulfill the cash or skin reward separately.**",ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
     try:
         user=await bot.fetch_user(req['user_id'])
-        await user.send(f"Your MRC points redemption #{request_id} for **{req['reward']}** was approved. The server admins will arrange fulfillment. New points balance: **{after}**.")
+        await user.send(f"Your MRC points redemption #{request_id} for **{req['reward']}** ({req['cost']} points) was approved. The server admins will arrange fulfillment. New points balance: **{after}**.")
     except (discord.HTTPException,discord.Forbidden):
         pass
 

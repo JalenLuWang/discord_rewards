@@ -1,12 +1,56 @@
+# MRC Discord Rewards Bot — New Payout Structure (November 2026)
+
+This release updates the existing Railway/Postgres bot. **Do not delete or recreate your Postgres database**; the new tables and columns are created during startup. Existing balances, history, and pending redemptions are retained, including their original costs. The pinned leaderboard now displays the updated rates.
+
+## Payout policy
+
+| Event | Participation | Most MVPs/SVPs | Second-most MVPs/SVPs |
+|---|---:|---:|---:|
+| Scrim (per BO3 or BO5) | +1 including benched | +9 | none |
+| MRC (weekly) | +1 including benched, once per calendar week (Monday start) | n/a | n/a |
+| MRC stage/day | none (weekly attendance is separate) | +29 | +14 |
+| Full-day tournament outside MRC | +1, full-day only | +19 | +9 |
+
+All participation and performance awards stack. Rewards: **1 point = $1; minimum redemption is 20 points**, for **$20 cash** or **one in-game skin valued up to $20**. Use `quantity:2` to request two units for 40 points. Cash and skin fulfillment is manual, with admin approval. Cash payout through Zelle, Venmo, or PayPal; no automatic payments.
+
+**Ties:** Players who tie for a position evenly split the sum of the performance prizes occupying their rank slots, rounded half-up **for each player**. Two players tied for first in MRC split 29+14, so each earns 22 points (44 total after rounding). Four tied for first in a scrim split 9, so each gets 2 (8 total after rounding). As specified, independent rounding can make the total awarded slightly higher or lower than the original prize pool. When there is a first-place tie, do not supply a second-place group. When one first-place winner exists, tied second-place winners split the second-place pool.
+
+## New event-specific commands (Admin / Manage Server)
+
+- `/points scrim event_id:2026-11-24-bo3-a members:<all present or benched> first:<top MVP/SVP members> reason:Opponent Name` — +1 to every listed member, plus the split 9-point first-place prize. Use a **different event_id for every BO3/BO5**.
+- `/points mrc-week week:2026-11-24 members:<roster including benched> reason:MRC week attendance` — +1 once per player per Monday-based week. Additional submissions for the same week award only members not already awarded.
+- `/points mrc-stage event_id:qualifier-day-1 members:<eligible players> first:<first place> second:<second place> reason:Closed Qualifiers Day 1` — awards 29 and 14; accepts grouped rounds such as `rounds-1-3`. If there is a first-place tie, omit `second`. **MRC participation is not awarded here.**
+- `/points tournament event_id:cup-day-1 members:<full-day participants> first:<first> second:<second> reason:Tournament Name full_day:True` — +1 attendance plus 19/9 performance; confirm full-day attendance explicitly. If first place tied, omit `second`.
+
+For `members`, `first`, and `second`, paste Discord mentions or IDs separated by spaces or commas (up to 25 unique members in a batch). Every winner must be listed among `members`. `reason` is required for every event and is saved in **each individual's transaction log**. Event commands make atomic batch updates, write separate participation/performance audit rows, and refresh the pinned leaderboard. Duplicate event IDs for the same event type are rejected to prevent double payments. Manual `/points add` and `/points remove` remain for corrections.
+
+## Existing commands
+
+`/points add`, `/points remove`, `/points remove-player`, `/points restore-player`, `/points balance`, `/points history`, `/points leaderboard`, `/points setup`, `/points refresh`, `/points redeem`, `/points requests`, `/points approve`, `/points deny` continue to work. Point-changing operations require **Manage Server** permission, consistent with the previous bot version. Removed players are hidden and cannot earn or redeem points until an admin restores them. Removing a faction member is an **admin command**, not automatic Discord role tracking.
+
+**Redeem:** `/points redeem reward:<Cash or Skin> quantity:1 details:<optional skin title>` creates a 20-point request. `quantity:5` creates a 100-point request. Points are deducted **only on approval**. The bot does not determine a skin's price or send funds; admins must verify the up-to-$20-per-skin limit and deliver the rewards.
+
+## Upgrade on Railway
+
+1. Back up Postgres first.
+2. Upload the **files inside this ZIP's `mrc-discord-points-bot` folder** to the root of your GitHub repository, replacing the previous version of `bot.py`, `points_core.py`, `README.md`, and tests. Do **not** commit `.env`.
+3. Railway should redeploy automatically. Use the same `DISCORD_TOKEN`, `DISCORD_GUILD_ID`, and Postgres `DATABASE_URL` reference. Do not recreate the database.
+4. Verify the new `/points scrim`, `/points mrc-week`, `/points mrc-stage`, and `/points tournament` commands appear. Test a unique event ID with a small roster, then inspect `/points history` and your leaderboard.
+5. Run `/points refresh` if the pinned message needs to be edited immediately. Check the most recent Railway Deploy Logs if command registration fails.
+
+**Limitations:** Event results and attendance are entered by admins, **not read from Marvel Rivals automatically**. Weekly attendance is keyed to an ISO date's Monday, and event IDs must be unique within their event type. Existing historical point awards are **not recalculated**. Existing pending redemptions retain their original point cost, and should be reviewed or denied by an admin if they were requested under the old policy.
+
+---
+
 # MRC Points Bot — Deploy to Railway
 
-A Discord bot for **point balances, scrim/MRC/tournament awards, transaction history, a pinned live leaderboard, and administrator-approved skin/$25 redemptions**.
+A Discord bot for **point balances, scrim/MRC/tournament awards, transaction history, a pinned live leaderboard, and administrator-approved skin/$20 redemptions**.
 
 ## How it works
 
 - **Admins** with **Manage Server** permission award and remove points.
 - Members request rewards with `/points redeem`; an admin approves or denies the request.
-- Approval atomically subtracts **5 points**, logs the transaction, and updates the live leaderboard.
+- Approval atomically subtracts **20 points**, logs the transaction, and updates the live leaderboard.
 - **Cash and skins are delivered manually by admins**, not by the bot.
 - Balances, redemptions and an **append-only point transaction ledger** persist in PostgreSQL.
 - Transaction entries show the member, amount, reason, current balance, actor, and timestamp.
@@ -60,7 +104,7 @@ These steps use **a background Python process plus a Railway PostgreSQL database
 | `/points balance` | Everyone | `/points balance member:@Alex` |
 | `/points history` | Everyone | `/points history member:@Alex` (10 most recent) |
 | `/points leaderboard` | Everyone | See top 20 (the pinned message also auto-updates) |
-| `/points redeem` | Everyone | Choose **Cash ($25)** or **Skin** |
+| `/points redeem` | Everyone | Choose **Cash ($20)** or **Skin** |
 | `/points requests` | Admins | Lists pending requests |
 | `/points approve` | Admins | `/points approve request_id:3` |
 | `/points deny` | Admins | `/points deny request_id:3 reason:Duplicate request` |
