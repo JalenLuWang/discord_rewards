@@ -3,7 +3,25 @@ from datetime import datetime, timezone
 import re
 
 REWARD_COST = 20
-REWARDS = {"Cash ($20 per unit)": "Cash", "Skin (up to $20 per unit)": "Skin"}
+REWARDS = {"Cash ($1 per point, minimum $20)": "Cash", "Skin (20 points each, up to $20)": "Skin"}
+
+def redemption_cost(reward: str, quantity: int = 1, points: int | None = None) -> int:
+    """Cash: any whole-number amount >=20; skins: 20 points each."""
+    if reward == "Cash":
+        if quantity != 1:
+            raise ValueError("For cash, use points rather than quantity (quantity must be 1).")
+        amount = REWARD_COST if points is None else points
+        if type(amount) is not int or not REWARD_COST <= amount <= 2_147_483_647:
+            raise ValueError("Cash redemptions require at least 20 whole points.")
+        return amount
+    if reward == "Skin":
+        if points is not None:
+            raise ValueError("For skins, use quantity (20 points per skin); leave points empty.")
+        if type(quantity) is not int or not 1 <= quantity <= 25:
+            raise ValueError("Choose between 1 and 25 skins per request.")
+        return REWARD_COST * quantity
+    raise ValueError("Unknown reward type.")
+
 
 SCRIM_PARTICIPATION = 1
 SCRIM_FIRST = 9

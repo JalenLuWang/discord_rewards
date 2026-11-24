@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from points_core import REWARD_COST, REWARDS, points_summary, point_word, utc_label, parse_member_ids, MAX_BULK_MEMBERS, payout_breakdown, MRC_WEEKLY_PARTICIPATION
+from points_core import REWARD_COST, REWARDS, points_summary, point_word, utc_label, parse_member_ids, MAX_BULK_MEMBERS, payout_breakdown, MRC_WEEKLY_PARTICIPATION, redemption_cost
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -146,7 +146,7 @@ async def leaderboard_embed(guild_id: int) -> discord.Embed:
     async with bot.pool.acquire() as db:
         rows = await db.fetch("SELECT user_id, balance FROM balances WHERE guild_id=$1 AND is_active=TRUE AND balance > 0 ORDER BY balance DESC, user_id ASC LIMIT 20", guild_id)
     embed = discord.Embed(title="🏆 MRC Points Leaderboard", description=points_summary(rows), color=0x5865f2)
-    embed.add_field(name="🎁 Rewards", value="**1 point = $1** · **20 points = $20 cash or 1 skin (up to $20)**", inline=False)
+    embed.add_field(name="🎁 Rewards", value="**Cash:** 1 point = $1 (minimum 20 points, any amount thereafter) · **Skins:** 20 points each (up to $20 value)", inline=False)
     embed.set_footer(text="Updated automatically • Top 20 members • /points balance for your balance")
     return embed
 
@@ -467,7 +467,7 @@ async def balance(interaction: discord.Interaction, member: Optional[discord.Mem
     async with bot.pool.acquire() as db:
         active = await db.fetchval("SELECT is_active FROM balances WHERE guild_id=$1 AND user_id=$2", interaction.guild_id,target.id)
     status = " **(removed from leaderboard)**" if active is False else ""
-    await interaction.response.send_message(f"{target.mention} has **{current or 0}** points{status}. (1 point = $1; 20 points = $20 cash or 1 skin up to $20)",ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.send_message(f"{target.mention} has **{current or 0}** points{status}. (cash: 1 point = $1, minimum 20; skins: 20 points each, up to $20)",ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
 
 @points.command(name="leaderboard", description="Show the current leaderboard")
 async def leaderboard(interaction: discord.Interaction):
@@ -485,10 +485,15 @@ async def history(interaction: discord.Interaction, member: Optional[discord.Mem
     await interaction.response.send_message(f"**Last {len(rows)} transactions for {target.mention}:**\n"+"\n".join(lines),ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
 
 @app_commands.choices(reward=[app_commands.Choice(name=k, value=v) for k,v in REWARDS.items()])
-@points.command(name="redeem", description="Request $20 cash or a skin (up to $20) per 20 points, admin approval")
-@app_commands.describe(quantity="Number of $20 cash units or skins (20 points each)", details="Skin name or optional payout note")
-async def redeem(interaction: discord.Interaction, reward: app_commands.Choice[str], quantity: app_commands.Range[int,1,25] = 1, details: app_commands.Range[str,0,200] = ""):
-    cost = REWARD_COST * quantity
+@points.command(name="redeem", description="Redeem 20+ points for any cash amount, or 20 points per skin")
+@app_commands.describe(quantity="Number of skins (1-25); leave as 1 for cash", points="Cash only: exact points to redeem, minimum 20; omit for $20", details="Skin name or optional payout note")
+async def redeem(interaction: discord.Interaction, reward: app_commands.Choice[str], quantity: app_commands.Range[int,1,25] = 1, points: Optional[int] = None, details: app_commands.Range[str,0,200] = ""):
+    try:
+        cost = redemption_cost(reward.value, quantity=quantity, points=points)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    description = f"${cost} cash" if reward.value == "Cash" else f"{quantity} × Skin"
     await interaction.response.defer(ephemeral=True)
     settings=await get_settings(interaction.guild_id)
     channel=await get_channel(interaction.guild,settings['approvals_channel_id'] if settings else None)
@@ -517,12 +522,12 @@ async def redeem(interaction: discord.Interaction, reward: app_commands.Choice[s
                 await interaction.followup.send("You already have a pending redemption. Ask an admin to resolve it first.",ephemeral=True)
                 return
     try:
-        await channel.send(f"🎁 **New redemption request #{row['id']}**\nMember: <@{interaction.user.id}>\nReward: **{quantity} × {reward.value}**\nDetails: {discord.utils.escape_markdown(details) if details else "None"}\nCost: **{cost} points**\nAdmin: `/points approve request_id:{row['id']}` or `/points deny request_id:{row['id']}`\n*Points are deducted only after approval.*",allowed_mentions=discord.AllowedMentions.none())
+        await channel.send(f"🎁 **New redemption request #{row['id']}**\nMember: <@{interaction.user.id}>\nReward: **{description}**\nDetails: {discord.utils.escape_markdown(details) if details else "None"}\nCost: **{cost} points**\nAdmin: `/points approve request_id:{row['id']}` or `/points deny request_id:{row['id']}`\n*Points are deducted only after approval.*",allowed_mentions=discord.AllowedMentions.none())
     except (discord.Forbidden, discord.HTTPException):
         log.exception("Failed to publish redemption request %s, admins can find it via /points requests", row['id'])
         await interaction.followup.send(f"Request **#{row['id']}** saved, but I couldn't post to the approvals channel. Tell an admin to check `/points requests`.",ephemeral=True)
         return
-    await interaction.followup.send(f"Request **#{row['id']}** submitted for **{quantity} × {reward.value}** ({cost} points). Your points will only be deducted if an admin approves it.",ephemeral=True)
+    await interaction.followup.send(f"Request **#{row['id']}** submitted for **{description}** ({cost} points). Your points will only be deducted if an admin approves it.",ephemeral=True)
 
 @points.command(name="requests", description="Admin: see the latest pending redemptions")
 async def requests(interaction: discord.Interaction):

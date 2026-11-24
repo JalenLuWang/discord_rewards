@@ -11,7 +11,7 @@ This release updates the existing Railway/Postgres bot. **Do not delete or recre
 | MRC stage/day | none (weekly attendance is separate) | +29 | +14 |
 | Full-day tournament outside MRC | +1, full-day only | +19 | +9 |
 
-All participation and performance awards stack. Rewards: **1 point = $1; minimum redemption is 20 points**, for **$20 cash** or **one in-game skin valued up to $20**. Use `quantity:2` to request two units for 40 points. Cash and skin fulfillment is manual, with admin approval. Cash payout through Zelle, Venmo, or PayPal; no automatic payments.
+All participation and performance awards stack. Rewards: **1 point = $1; minimum cash redemption is 20 points**, for **cash at $1 per point in any whole-number amount of at least 20 points**, or **one in-game skin valued up to $20 for every 20 points**. Cash requests can be 21, 25, 37, 99 points, etc. Skin quantities stay in multiples of 20 points. Cash and skin fulfillment is manual, with admin approval. Cash payout through Zelle, Venmo, or PayPal; no automatic payments.
 
 **Ties:** Players who tie for a position evenly split the sum of the performance prizes occupying their rank slots, rounded half-up **for each player**. Two players tied for first in MRC split 29+14, so each earns 22 points (44 total after rounding). Four tied for first in a scrim split 9, so each gets 2 (8 total after rounding). As specified, independent rounding can make the total awarded slightly higher or lower than the original prize pool. When there is a first-place tie, do not supply a second-place group. When one first-place winner exists, tied second-place winners split the second-place pool.
 
@@ -28,7 +28,7 @@ For `members`, `first`, and `second`, paste Discord mentions or IDs separated by
 
 `/points add`, `/points remove`, `/points remove-player`, `/points restore-player`, `/points balance`, `/points history`, `/points leaderboard`, `/points setup`, `/points refresh`, `/points redeem`, `/points requests`, `/points approve`, `/points deny` continue to work. Point-changing operations require **Manage Server** permission, consistent with the previous bot version. Removed players are hidden and cannot earn or redeem points until an admin restores them. Removing a faction member is an **admin command**, not automatic Discord role tracking.
 
-**Redeem:** `/points redeem reward:<Cash or Skin> quantity:1 details:<optional skin title>` creates a 20-point request. `quantity:5` creates a 100-point request. Points are deducted **only on approval**. The bot does not determine a skin's price or send funds; admins must verify the up-to-$20-per-skin limit and deliver the rewards.
+**Redeem:** `/points redeem reward:Cash points:37` requests **$37 for 37 points**. `/points redeem reward:Cash` defaults to $20. `/points redeem reward:Skin quantity:2 details:<skin names>` requests **two skins for 40 points**. For cash, leave `quantity` at 1; for skins, leave `points` empty. Points are deducted **only on approval**. The bot does not determine a skin's price or send funds; admins must verify the up-to-$20-per-skin limit and deliver the rewards.
 
 ## Upgrade on Railway
 
@@ -44,13 +44,13 @@ For `members`, `first`, and `second`, paste Discord mentions or IDs separated by
 
 # MRC Points Bot — Deploy to Railway
 
-A Discord bot for **point balances, scrim/MRC/tournament awards, transaction history, a pinned live leaderboard, and administrator-approved skin/$20 redemptions**.
+A Discord bot for **point balances, scrim/MRC/tournament awards, transaction history, a pinned live leaderboard, and administrator-approved cash (any whole amount ≥$20) and skin redemptions**.
 
 ## How it works
 
 - **Admins** with **Manage Server** permission award and remove points.
 - Members request rewards with `/points redeem`; an admin approves or denies the request.
-- Approval atomically subtracts **20 points**, logs the transaction, and updates the live leaderboard.
+- Approval atomically subtracts **the exact approved redemption cost**, logs the transaction, and updates the live leaderboard.
 - **Cash and skins are delivered manually by admins**, not by the bot.
 - Balances, redemptions and an **append-only point transaction ledger** persist in PostgreSQL.
 - Transaction entries show the member, amount, reason, current balance, actor, and timestamp.
@@ -104,7 +104,7 @@ These steps use **a background Python process plus a Railway PostgreSQL database
 | `/points balance` | Everyone | `/points balance member:@Alex` |
 | `/points history` | Everyone | `/points history member:@Alex` (10 most recent) |
 | `/points leaderboard` | Everyone | See top 20 (the pinned message also auto-updates) |
-| `/points redeem` | Everyone | Choose **Cash ($20)** or **Skin** |
+| `/points redeem` | Everyone | Choose **Cash** (20+ points, $1 per point) or **Skin** (20 points each) |
 | `/points requests` | Admins | Lists pending requests |
 | `/points approve` | Admins | `/points approve request_id:3` |
 | `/points deny` | Admins | `/points deny request_id:3 reason:Duplicate request` |
