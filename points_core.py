@@ -2,24 +2,45 @@
 from datetime import datetime, timezone
 import re
 
-REWARD_COST = 20
-REWARDS = {"Cash ($1 per point, minimum $20)": "Cash", "Skin (20 points each, up to $20)": "Skin"}
+# Rewards: 10 points unlocks cash redemptions; any whole-number amount
+# of at least 10 points can be requested at $1 per point. A skin costs 20 points.
+# The existing $20 maximum skin value remains unchanged in this release.
+REWARD_COST = 10
+MIN_CASH_POINTS = REWARD_COST
+SKIN_POINTS = 20
+SKIN_MAX_VALUE = 20
+REWARDS = {
+    "Cash ($1/point, minimum $10)": "Cash",
+    "Skin (20 points each, up to $20)": "Skin",
+}
+LEADERBOARD_REWARDS = (
+    "**Cash:** **1 point = $1**. The minimum cash payout is **10 points ($10)**. "
+    "Once you have at least 10 points, redeem any **whole-dollar amount from $10 "
+    "up to your available balance** (no $10 increments required).\n"
+    f"**Skins:** **{SKIN_POINTS} points per skin** (up to **${SKIN_MAX_VALUE} value** each). "
+    "All redemptions require admin approval."
+)
+BALANCE_REWARDS = (
+    f"Cash: 1 point = $1; minimum payout ${MIN_CASH_POINTS}, "
+    "then any whole-dollar amount of $10 or more up to your balance; "
+    f"skins: {SKIN_POINTS} points each (up to ${SKIN_MAX_VALUE} value)"
+)
 
 def redemption_cost(reward: str, quantity: int = 1, points: int | None = None) -> int:
-    """Cash: any whole-number amount >=20; skins: 20 points each."""
+    """Cash: any whole-number amount >=10; skins: 20 points each."""
     if reward == "Cash":
         if quantity != 1:
             raise ValueError("For cash, use points rather than quantity (quantity must be 1).")
         amount = REWARD_COST if points is None else points
-        if type(amount) is not int or not REWARD_COST <= amount <= 2_147_483_647:
-            raise ValueError("Cash redemptions require at least 20 whole points.")
+        if type(amount) is not int or not MIN_CASH_POINTS <= amount <= 2_147_483_647:
+            raise ValueError("Cash withdrawals require at least 10 whole points ($10). You can request any whole-dollar amount above that minimum.")
         return amount
     if reward == "Skin":
         if points is not None:
-            raise ValueError("For skins, use quantity (20 points per skin); leave points empty.")
+            raise ValueError(f"For skins, use quantity ({SKIN_POINTS} points per skin); leave points empty.")
         if type(quantity) is not int or not 1 <= quantity <= 25:
             raise ValueError("Choose between 1 and 25 skins per request.")
-        return REWARD_COST * quantity
+        return SKIN_POINTS * quantity
     raise ValueError("Unknown reward type.")
 
 
